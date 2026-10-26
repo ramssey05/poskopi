@@ -1049,13 +1049,13 @@ function printViaRawBTText(plainText) {
   const fullData = initPrinter + plainText;
   const base64Data = btoa(unescape(encodeURIComponent(fullData)));
   
-  // Menggunakan URI scheme langsung tanpa batasan package name
-  const rawbtUrl = 'rawbt:base64,' + base64Data;
+  // Perbaiki bagian '-base64,' menjadi ':base64,'
+  const intentUrl = 'intent:base64,' + base64Data + '#Intent;scheme=rawbt;package=ru.a404m.rawbtprinter;end;';
   
-  try {
-    window.location.href = rawbtUrl;
-  } catch(e) {
-    toast('RawBT tidak dapat dibuka.');
+  try { 
+    window.location.href = intentUrl; 
+  } catch(e) { 
+    toast('RawBT tidak dapat dibuka.'); 
   }
 }
 
@@ -1202,16 +1202,41 @@ async function printPreviewReceipt(){
 }
 
 async function writeBluetoothReceipt(plainText){
-  if(btState!=='connected'||!printCharacteristic) return false;
+  if(btState!=='connected'||!printCharacteristic){
+    throw new Error('Bluetooth Direct belum terhubung atau karakteristik printer tidak tersedia.');
+  }
+
   const ESC='\x1B';
-  const data=new TextEncoder().encode(ESC+'@'+plainText);
-  const chunkSize=printCharacteristic.properties?.writeWithoutResponse ? 180 : 180;
+  const data=new TextEncoder().encode(ESC+'@'+String(plainText??''));
+  // Potongan lebih kecil membantu printer BLE memproses laporan panjang.
+  const chunkSize=100;
+
   for(let i=0;i<data.length;i+=chunkSize){
     const chunk=data.slice(i,i+chunkSize);
-    if(printCharacteristic.properties?.writeWithoutResponse && printCharacteristic.writeValueWithoutResponse)
-      await printCharacteristic.writeValueWithoutResponse(chunk);
-    else
-      await printCharacteristic.writeValue(chunk);
+    let sent=false;
+    let lastError=null;
+
+    // Coba ulang satu kali jika printer menolak potongan data.
+    for(let attempt=0;attempt<2&&!sent;attempt++){
+      try{
+        if(printCharacteristic.properties?.writeWithoutResponse && printCharacteristic.writeValueWithoutResponse){
+          await printCharacteristic.writeValueWithoutResponse(chunk);
+        }else{
+          await printCharacteristic.writeValue(chunk);
+        }
+        sent=true;
+      }catch(e){
+        lastError=e;
+        if(attempt===0) await new Promise(resolve=>setTimeout(resolve,100));
+      }
+    }
+
+    if(!sent) throw lastError||new Error('Pengiriman data ke printer gagal.');
+
+    // Beri waktu printer memproses sebelum potongan berikutnya.
+    if(i+chunkSize<data.length){
+      await new Promise(resolve=>setTimeout(resolve,35));
+    }
   }
   return true;
 }
@@ -1535,17 +1560,32 @@ function openOwnerDailyReportPreview(f, t, sh, sales){
 
 async function printOwnerReportPreview(){
   const preview = document.querySelector('#receiptPreviewBackdrop .receipt-print-paper[data-owner-report="1"]');
-  if(!preview) return alert('Error: Elemen preview laporan tidak ditemukan!');
+  if(!preview) return;
 
   const plainText = preview.dataset.plainText || '';
-  if(!plainText) return alert('Error: Teks laporan (plainText) kosong!');
 
-  // Paksa tes lemparkan langsung ke RawBT untuk memastikan apakah RawBT mau merespons atau tidak
-  const base64Data = btoa(unescape(encodeURIComponent(plainText)));
-  const rawbtUrl = 'rawbt:base64,'+base64Data;
+  // 1. Jika Bluetooth Direct terhubung, cetak langsung
+  if(btState === 'connected' && printCharacteristic){
+    try{
+      await writeBluetoothReceipt(plainText);
+      toast('Laporan Owner berhasil dicetak langsung via Bluetooth.');
+      closeReceiptPreview();
+      return;
+    }catch(e){
+      console.error('Direct Web Bluetooth laporan owner failed:', e);
+      resetBTState();
+    }
+  }
+
+  // 2. Jika di Android (Bluetooth belum terhubung), langsung gunakan RawBT
+  if(navigator.userAgent.includes('Android')){
+    printViaRawBTText(plainText);
+    closeReceiptPreview();
+    return;
+  }
   
-  alert('Mencoba membuka RawBT dengan teks sepanjang: ' + plainText.length + ' karakter');
-  window.location.href = rawbtUrl;
+  // 3. Fallback browser biasa
+  window.print();
 }
 
 async function printOwnerDailyReport(){
@@ -1556,31 +1596,46 @@ async function printOwnerDailyReport(){
   if(!f || !t) return toast('Tanggal laporan belum dipilih.');
   if(f > t) return toast('Tanggal mulai tidak boleh lebih besar dari tanggal akhir.');
 
-  const sales = db.sales.filter(s =>
-    s.businessDate >= f && s.businessDate <= t && (!sh || s.shift === sh) && !s.voided
-  );
+  // PROSES FILTER BARU: DIJAMIN MEMBACA TANGGAL SECARA AKURAT
+  const sales = db.sales.filter(s => {
+    if (!s.businessDate) return false;
+    
+    // POTONG JAM & MENIT: Mengubah "2026-10-27 12:00:00" menjadi "2026-10-27" saja
+    const tglMurniData = String(s.businessDate).substring(0, 10);
+    
+    // Cocokkan apakah tanggal berada di dalam rentang
+    const matchDate = tglMurniData >= f && tglMurniData <= t;
+    
+    // Cocokkan shift tanpa memedulikan tipe data teks atau angka
+    const matchShift = !sh || String(s.shift) === String(sh);
+    
+    // Pastikan transaksi bukan status Void
+    const notVoided = !s.voided;
+
+    return matchDate && matchShift && notVoided;
+  });
+
+  // JALUR PENYELAMAT: Jika data masih 0, munculkan peringatan agar tidak buang kertas struk
+  if (!sales || sales.length === 0) {
+    return toast('Sistem mendeteksi 0 Transaksi. Pastikan rentang tanggal/shift sudah ada penjualan.');
+  }
 
   const plainText = generateOwnerDailyReportText(f, t, sh, sales);
 
-  // 1. PRIORITAS UTAMA: Jika Bluetooth Direct sudah terhubung, cetak langsung tanpa preview
+  // Jika Direct Bluetooth aktif, gunakan jalur kirim yang sama dengan struk.
   if(btState === 'connected' && printCharacteristic){
     try{
       await writeBluetoothReceipt(plainText);
-      toast('Laporan Owner berhasil dicetak langsung via Bluetooth.');
+      toast('Laporan berhasil dikirim ke printer Bluetooth.');
       return;
     }catch(e){
-      console.error('Direct Web Bluetooth laporan owner failed:', e);
-      resetBTState();
+      console.error('Gagal mencetak laporan via Bluetooth Direct:', e);
+      toast('Laporan gagal dikirim ke printer. Periksa koneksi Bluetooth dan coba lagi.');
+      return;
     }
   }
 
-  // 2. KONDISI ANDROID: Langsung lempar ke RawBT tanpa membuka modal preview (Sama seperti Struk/Void/Reprint)
-  if(navigator.userAgent.includes('Android')){
-    printViaRawBTText(plainText);
-    return;
-  }
-
-  // 3. Jika di Desktop / iOS dan Bluetooth tidak terhubung, baru buka preview
+  // Preview hanya digunakan jika Bluetooth Direct memang tidak aktif.
   openOwnerDailyReportPreview(f, t, sh, sales);
 }
 
