@@ -1047,15 +1047,25 @@ function printViaRawBTText(plainText) {
   const ESC = '\x1B';
   const initPrinter = ESC + '@';
   const fullData = initPrinter + plainText;
+  
+  // Konversi teks laporan ke format Base64 yang aman untuk Android
   const base64Data = btoa(unescape(encodeURIComponent(fullData)));
   
-  // Perbaiki bagian '-base64,' menjadi ':base64,'
-  const intentUrl = 'intent:base64,' + base64Data + '#Intent;scheme=rawbt;package=ru.a404m.rawbtprinter;end;';
+  // PERBAIKAN FATAL: Format URL Intent Android yang benar agar langsung masuk ke aplikasi RawBT
+  const intentUrl = 'intent:#Intent;' +
+    'action=ru.a404m.rawbtprinter.action.PRINT;' +
+    'category=android.intent.category.DEFAULT;' +
+    'type=text/plain;' +
+    'S.base64=' + base64Data + ';' +
+    'package=ru.a404m.rawbtprinter;' +
+    'end;';
   
   try { 
+    // Paksa tablet Android membuka aplikasi RawBT dan langsung ngeprint
     window.location.href = intentUrl; 
+    toast('Mengirim laporan ke aplikasi RawBT...');
   } catch(e) { 
-    toast('RawBT tidak dapat dibuka.'); 
+    toast('Aplikasi RawBT tidak dapat dibuka di tablet ini.'); 
   }
 }
 
@@ -1216,31 +1226,46 @@ async function writeBluetoothReceipt(plainText){
   return true;
 }
 
-async function writeBluetoothReportOnly(plainText){
-  if(btState!=='connected' || !printCharacteristic) return false;
-  
-  const ESC = '\x1B';
-  const data = new TextEncoder().encode(ESC + '@' + plainText);
-  
-  // Ukuran potongan data yang pas untuk karakteristik BLE RPP02N
-  const chunkSize = 180; 
-  
-  for(let i=0; i<data.length; i+=chunkSize){
-    if(btState!=='connected' || !printCharacteristic) return false;
-    
-    const chunk = data.slice(i, i+chunkSize);
-    
-    if(printCharacteristic.properties?.writeWithoutResponse && printCharacteristic.writeValueWithoutResponse) {
+
+async function writeBluetoothReportOnly(plainText) {
+  if (btState !== 'connected' || !printCharacteristic) {
+    throw new Error('Printer Bluetooth belum terhubung.');
+  }
+
+  const data = new TextEncoder().encode('\x1B@' + plainText);
+
+  const canWriteWithoutResponse =
+    !!printCharacteristic.properties?.writeWithoutResponse &&
+    typeof printCharacteristic.writeValueWithoutResponse === 'function';
+
+  const canWrite =
+    !!printCharacteristic.properties?.write &&
+    typeof printCharacteristic.writeValue === 'function';
+
+  if (!canWriteWithoutResponse && !canWrite) {
+    throw new Error('Printer tidak mendukung pengiriman data.');
+  }
+
+  const chunkSize = 180;
+
+  for (let i = 0; i < data.length; i += chunkSize) {
+    if (btState !== 'connected' || !printCharacteristic) {
+      throw new Error('Koneksi printer terputus.');
+    }
+
+    const chunk = data.slice(i, i + chunkSize);
+
+    if (canWriteWithoutResponse) {
       await printCharacteristic.writeValueWithoutResponse(chunk);
+
+      if (i + chunkSize < data.length) {
+        await new Promise(resolve => setTimeout(resolve, 15));
+      }
     } else {
       await printCharacteristic.writeValue(chunk);
     }
-    
-    // === KUNCI UTAMA: Memberikan jeda napas 15 milidetik ke printer RPP02N ===
-    if (i + chunkSize < data.length) {
-      await new Promise(resolve => setTimeout(resolve, 15));
-    }
   }
+
   return true;
 }
 
@@ -1591,57 +1616,80 @@ async function printOwnerReportPreview(){
   window.print();
 }
 
-async function printOwnerDailyReport(){
+
+async function printOwnerDailyReport() {
   const f = document.getElementById('rFrom')?.value || dateKey();
   const t = document.getElementById('rTo')?.value || f;
   const sh = document.getElementById('rShift')?.value || '';
 
-  if(!f || !t) return toast('Tanggal laporan belum dipilih.');
-  if(f > t) return toast('Tanggal mulai tidak boleh lebih besar dari tanggal akhir.');
+  if (!f || !t) {
+    return toast('Tanggal laporan belum dipilih.');
+  }
 
-  // Proses filter rentang tanggal akurat (Memotong jam & menit)
+  if (f > t) {
+    return toast('Tanggal mulai tidak boleh lebih besar dari tanggal akhir.');
+  }
+
+  // Filter transaksi berdasarkan tanggal, shift, dan status void.
   const sales = db.sales.filter(s => {
     if (!s.businessDate) return false;
+
     const tglMurniData = String(s.businessDate).substring(0, 10);
     const matchDate = tglMurniData >= f && tglMurniData <= t;
     const matchShift = !sh || String(s.shift) === String(sh);
     const notVoided = !s.voided;
+
     return matchDate && matchShift && notVoided;
   });
 
-  if (!sales || sales.length === 0) {
-    return toast('Sistem mendeteksi 0 Transaksi untuk tanggal/shift ini.');
+  if (sales.length === 0) {
+    return toast('Tidak ada transaksi untuk tanggal/shift ini.');
   }
 
-  // Generate teks laporan
-  let plainText = generateOwnerDailyReportText(f, t, sh, sales);
-  
-  // Bersihkan karakter asing agar driver printer 58mm tidak bingung
-  plainText = String(plainText).replace(/[^\x20-\x7E\n]/g, ''); 
+  // Buat teks laporan tanpa menghapus karakter dari hasil aslinya.
+  const plainText = String(
+    generateOwnerDailyReportText(f, t, sh, sales)
+  );
 
-  // Mengirim data langsung ke mesin printer Smartcom RPP02N
-  if(btState === 'connected' && printCharacteristic){
-    try{
-      toast('Sedang mencetak laporan ke printer RPP02N...');
-      
-      // Memanggil fungsi khusus report yang memiliki jeda napas data
-      await writeBluetoothReportOnly(plainText);
-      
-      // Dorong kertas kosong ekstra manual di akhir agar teks keluar penuh dari gerigi sobekan
-      await writeBluetoothReportOnly('\n\n\n\n');
-      
-      toast('Laporan Owner berhasil dicetak langsung via Bluetooth.');
+  // Jika Bluetooth Direct terhubung, gunakan fungsi khusus laporan.
+  if (btState === 'connected' && printCharacteristic) {
+    try {
+      toast('Sedang mengirim laporan ke printer...');
+
+      const success = await writeBluetoothReportOnly(plainText);
+
+      if (!success) {
+        throw new Error('Pengiriman laporan gagal.');
+      }
+
+      // Majukan kertas setelah seluruh teks laporan dikirim.
+      const paperFeedSuccess =
+        await writeBluetoothReportOnly('\n\n\n\n');
+
+      if (!paperFeedSuccess) {
+        throw new Error('Perintah maju kertas gagal dikirim.');
+      }
+
+      toast('Laporan berhasil dikirim ke printer Bluetooth.');
       return;
-    }catch(e){
-      console.error('Direct Web Bluetooth laporan owner failed:', e);
-      resetBTState();
-      toast('Gagal mencetak fisik. Dialihkan ke preview layar.');
+
+    } catch (e) {
+      // Pertahankan koneksi agar tidak langsung memutus Bluetooth
+      // hanya karena satu operasi cetak gagal.
+      console.error('Gagal mengirim laporan Bluetooth:', e);
+
+      toast(
+        'Laporan gagal dikirim. Periksa printer dan koneksi Bluetooth.'
+      );
+
+      return;
     }
   }
 
-  // Jika koneksi putus baru lari ke preview layar
+  // Preview hanya dibuka jika Bluetooth Direct belum terhubung.
   openOwnerDailyReportPreview(f, t, sh, sales);
 }
+
 
 
 function exportExcel(){
