@@ -1044,13 +1044,19 @@ function generateReceiptText(s, isVoid=false, reprint=false) {
 }
 
 function printViaRawBTText(plainText) {
-  const ESC='\x1B';
-  const initPrinter=ESC+'@';
-  const fullData=initPrinter+plainText;
-  const base64Data=btoa(unescape(encodeURIComponent(fullData)));
-  const intentUrl='intent:-base64,'+base64Data+'#Intent;scheme=rawbt;package=ru.a404m.rawbtprinter;end;';
-  try{ window.location.href=intentUrl; }
-  catch(e){ toast('RawBT tidak dapat dibuka.'); }
+  const ESC = '\x1B';
+  const initPrinter = ESC + '@';
+  const fullData = initPrinter + plainText;
+  const base64Data = btoa(unescape(encodeURIComponent(fullData)));
+  
+  // Menggunakan URI scheme langsung tanpa batasan package name
+  const rawbtUrl = 'rawbt:base64,' + base64Data;
+  
+  try {
+    window.location.href = rawbtUrl;
+  } catch(e) {
+    toast('RawBT tidak dapat dibuka.');
+  }
 }
 
 function receiptHTML(s,isVoid=false,reprint=false){
@@ -1529,32 +1535,17 @@ function openOwnerDailyReportPreview(f, t, sh, sales){
 
 async function printOwnerReportPreview(){
   const preview = document.querySelector('#receiptPreviewBackdrop .receipt-print-paper[data-owner-report="1"]');
-  if(!preview) return;
+  if(!preview) return alert('Error: Elemen preview laporan tidak ditemukan!');
 
   const plainText = preview.dataset.plainText || '';
+  if(!plainText) return alert('Error: Teks laporan (plainText) kosong!');
 
-  // 1. Jika Bluetooth Direct terhubung, cetak langsung
-  if(btState === 'connected' && printCharacteristic){
-    try{
-      await writeBluetoothReceipt(plainText);
-      toast('Laporan Owner berhasil dicetak langsung via Bluetooth.');
-      closeReceiptPreview();
-      return;
-    }catch(e){
-      console.error('Direct Web Bluetooth laporan owner failed:', e);
-      resetBTState();
-    }
-  }
-
-  // 2. Jika di Android (Bluetooth belum terhubung), langsung gunakan RawBT
-  if(navigator.userAgent.includes('Android')){
-    printViaRawBTText(plainText);
-    closeReceiptPreview();
-    return;
-  }
+  // Paksa tes lemparkan langsung ke RawBT untuk memastikan apakah RawBT mau merespons atau tidak
+  const base64Data = btoa(unescape(encodeURIComponent(plainText)));
+  const rawbtUrl = 'rawbt:base64,'+base64Data;
   
-  // 3. Fallback browser biasa
-  window.print();
+  alert('Mencoba membuka RawBT dengan teks sepanjang: ' + plainText.length + ' karakter');
+  window.location.href = rawbtUrl;
 }
 
 async function printOwnerDailyReport(){
